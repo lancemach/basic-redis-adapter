@@ -1,5 +1,5 @@
 {
-  "name": "casbin-basic-adapter",
+  "name": "casbin-basic-cacheable-adapter",
   "version": "1.1.0",
   "description": "A basic adapter supports pg, sqlite3, mysql, mysql2, oracledb and mssql",
   "main": "lib/adapter.js",
@@ -12,6 +12,7 @@
     "test": "jest --forceExit"
   },
   "dependencies": {
+    "ioredis": "^5.4.1",
     "knex": "^2.5.1"
   },
   "devDependencies": {

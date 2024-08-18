@@ -19,14 +19,14 @@ import type * as mysql from 'mysql';
 import type * as mysql2 from 'mysql2/promise';
 import type * as sqlite3 from 'sqlite3';
 import type * as mssql from 'mssql';
-// import type * as oracledb from 'oracledb';
-
+import Redis from 'ioredis'; // 引入 Redis 客户端
 import { Helper } from 'casbin';
 import * as Knex from 'knex';
 
 export type Config = Knex.Knex.Config & {
   client: keyof Instance;
 };
+
 export type Instance = {
   pg: pg.Client;
   mysql: mysql.Connection;
@@ -42,8 +42,9 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
   private config: Config;
   private drive: T;
   private client: Instance[T];
+  private redisClient?: Redis; // Redis 客户端实例
 
-  private constructor(drive: T, client: Instance[T]) {
+  private constructor(drive: T, client: Instance[T], redisClient?: Redis) {
     this.config = {
       client: drive,
       useNullAsDefault: drive === 'sqlite3',
@@ -52,13 +53,15 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
     this.knex = Knex.knex(this.config);
     this.drive = drive;
     this.client = client;
+    this.redisClient = redisClient; // 初始化 Redis 客户端
   }
 
   static async newAdapter<T extends keyof Instance>(
     drive: T,
     client: Instance[T],
+    redisClient?: Redis, // 接受 Redis 实例
   ): Promise<BasicAdapter<T>> {
-    const a = new BasicAdapter(drive, client);
+    const a = new BasicAdapter(drive, client, redisClient);
     await a.connect();
     await a.createTable();
 
@@ -66,12 +69,31 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
   }
 
   async loadPolicy(model: Model): Promise<void> {
+    // 从 Redis 中获取缓存的策略
+    if (this.redisClient) {
+      const cachedPolicy = await this.redisClient.get(CasbinRuleTable);
+
+      if (cachedPolicy) {
+        const lines = JSON.parse(cachedPolicy);
+        for (const line of lines) {
+          this.loadPolicyLine(line, model);
+        }
+        return; // 如果缓存存在，则不再从数据库加载
+      }
+    }
+
+    // 如果没有缓存，从数据库加载
     const result = await this.query(
       this.knex.select().from(CasbinRuleTable).toQuery(),
     );
 
     for (const line of result) {
       this.loadPolicyLine(line, model);
+    }
+
+    // 将加载的策略缓存到 Redis
+    if (this.redisClient) {
+      await this.redisClient.set(CasbinRuleTable, JSON.stringify(result));
     }
   }
 
@@ -104,12 +126,22 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
 
     await Promise.all(processes);
 
+    // 清除 Redis 中的缓存
+    if (this.redisClient) {
+      await this.redisClient.del(CasbinRuleTable);
+    }
+
     return true;
   }
 
   async addPolicy(sec: string, ptype: string, rule: string[]): Promise<void> {
     const line = this.savePolicyLine(ptype, rule);
     await this.query(this.knex.insert(line).into(CasbinRuleTable).toQuery());
+
+    // 清除 Redis 中的缓存
+    if (this.redisClient) {
+      await this.redisClient.del(CasbinRuleTable);
+    }
   }
 
   async addPolicies(
@@ -127,6 +159,11 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
     }
 
     await Promise.all(processes);
+
+    // 清除 Redis 中的缓存
+    if (this.redisClient) {
+      await this.redisClient.del(CasbinRuleTable);
+    }
   }
 
   async removePolicy(
@@ -138,6 +175,11 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
     await this.query(
       this.knex.del().where(line).from(CasbinRuleTable).toQuery(),
     );
+
+    // 清除 Redis 中的缓存
+    if (this.redisClient) {
+      await this.redisClient.del(CasbinRuleTable);
+    }
   }
 
   async removePolicies(
@@ -155,6 +197,11 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
     }
 
     await Promise.all(processes);
+
+    // 清除 Redis 中的缓存
+    if (this.redisClient) {
+      await this.redisClient.del(CasbinRuleTable);
+    }
   }
 
   async removeFilteredPolicy(
@@ -188,6 +235,11 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
     await this.query(
       this.knex.del().where(line).from(CasbinRuleTable).toQuery(),
     );
+
+    // 清除 Redis 中的缓存
+    if (this.redisClient) {
+      await this.redisClient.del(CasbinRuleTable);
+    }
   }
 
   async close(): Promise<void> {
@@ -195,12 +247,10 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
       case 'pg':
       case 'mysql': {
         await (<BasicAdapter<'pg' | 'mysql'>>this).client.end();
-
         break;
       }
       case 'mysql2': {
         await (await (<BasicAdapter<'mysql2'>>this).client).end();
-
         break;
       }
       case 'sqlite3': {
@@ -209,18 +259,20 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
             if (err) {
               reject(err);
             }
-
             resolve();
           });
         });
-
         break;
       }
       case 'mssql': {
         await (<BasicAdapter<'mssql'>>this).client.close();
-
         break;
       }
+    }
+
+    // 关闭 Redis 客户端
+    if (this.redisClient) {
+      await this.redisClient.quit();
     }
   }
 
@@ -286,7 +338,6 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
     switch (this.drive) {
       case 'pg': {
         await (<BasicAdapter<'pg'>>this).client.connect();
-
         break;
       }
       case 'mysql': {
@@ -296,22 +347,18 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
             resolve();
           });
         });
-
         break;
       }
       case 'mysql2': {
         await (<BasicAdapter<'mysql2'>>this).client;
-
         break;
       }
       case 'sqlite3': {
         // sqlite3 will connect automatically
-
         break;
       }
       case 'mssql': {
         await (<BasicAdapter<'mssql'>>this).client.connect();
-
         break;
       }
     }
@@ -325,7 +372,6 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
         result = (
           await (<BasicAdapter<'pg'>>this).client.query<CasbinRule>(sql)
         ).rows;
-
         break;
       }
       case 'mysql': {
@@ -335,14 +381,12 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
             resolve(rows);
           });
         });
-
         break;
       }
       case 'mysql2': {
         result = (
           await (await (<BasicAdapter<'mysql2'>>this).client).query(sql)
         )[0] as CasbinRule[];
-
         break;
       }
       case 'sqlite3': {
@@ -350,18 +394,15 @@ export class BasicAdapter<T extends keyof Instance> implements Adapter {
           (resolve, reject) => {
             (<BasicAdapter<'sqlite3'>>this).client.all(sql, (err, rows) => {
               if (err) reject(err);
-
               resolve(rows as CasbinRule[]);
             });
           },
         );
-
         break;
       }
       case 'mssql': {
         result = (await (<BasicAdapter<'mssql'>>this).client.query(sql))
           .recordset as unknown as CasbinRule[] | undefined;
-
         break;
       }
     }
